@@ -10,10 +10,16 @@ from steve_desktop.vault import Vault
 _lock = threading.RLock()
 
 
-def _redact(text, secrets=()):
+def _redact_secrets(text, secrets=()):
+    """The exact secrets this app holds, longest first."""
     text = str(text)
     for secret in sorted((str(s) for s in secrets if s and len(str(s)) >= 4), key=len, reverse=True):
         text = text.replace(secret, '[redacted]')
+    return text
+
+
+def _redact(text, secrets=()):
+    text = _redact_secrets(text, secrets)
     text = re.sub(r'https?://[^\s<>\"\']+', '[URL omitted]', text)
     text = re.sub(r'data:image/[^\s\"\']+', '[image omitted]', text)
     text = re.sub(r'(?i)(bearer\s+)[^\s,;\"\']+', r'\1[redacted]', text)
@@ -47,21 +53,38 @@ def redact_report(text, secrets=(), home=None, user=None):
             user = getpass.getuser()
         except Exception:
             user = ''
-    text = _redact(text, secrets)
+    # Known secrets first, while they're still exactly as held: the home, email and
+    # account-name passes below could change part of one so it no longer matches.
+    text = _redact_secrets(text, secrets)
+    # Apply home / email / username before the long-token wipe so absolute paths that
+    # are ≥80 characters (common under macOS /var/folders/…) become [home] instead of
+    # [long value omitted]. Keep both the lexical and resolved forms: on Darwin,
+    # /var is a symlink to /private/var, so tempfile paths and Path.resolve() disagree.
     text = EMAIL.sub('[email]', text)
     for pattern, replacement in HOME_FOLDERS:
         text = pattern.sub(replacement, text)
     homes = []
     if home and len(home) > 3:  # A home folder outside the usual locations.
         homes.append(home)
+        home_path = Path(home)
         try:
             # Tracebacks often contain the resolved path when the home directory
             # itself is a symlink (another disk, or a bind mount).
-            resolved = str(Path(home).resolve())
+            resolved = str(home_path.resolve())
         except OSError:
             resolved = ''
-        if resolved and len(resolved) > 3 and resolved not in homes:
+        if resolved and len(resolved) > 3:
             homes.append(resolved)
+            # /private/var/… ↔ /var/… (and the same for /tmp).
+            if resolved.startswith('/private/'):
+                homes.append(resolved[len('/private'):])
+        try:
+            if home_path.is_symlink():
+                link = home_path.readlink()
+                target = link if link.is_absolute() else home_path.parent / link
+                homes.append(str(target))
+        except OSError:
+            pass
     forms = []
     for item in homes:
         forms.extend((item, item.replace('\\', '/'), item.replace('\\', '\\\\')))
@@ -70,7 +93,7 @@ def redact_report(text, secrets=(), home=None, user=None):
             text = re.sub(re.escape(form) + r'(?![A-Za-z0-9._-])', '[home]', text, flags=re.I)
     if user and len(user) >= 3:
         text = re.sub(r'(?<![A-Za-z0-9])' + re.escape(user) + r'(?![A-Za-z0-9])', '[user]', text, flags=re.I)
-    return text
+    return _redact(text)
 
 
 def tail_bytes(text, limit):
